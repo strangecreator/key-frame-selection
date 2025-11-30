@@ -16,6 +16,10 @@ def extract_with_ffmpeg(
     overwrite: bool = False
 ) -> None:
     out = Path(out_dir)
+
+    if out.exists() and not overwrite:
+        return
+
     out.mkdir(parents=True, exist_ok=True)
     pattern = (out / f"%06d.{ext}").as_posix()
 
@@ -32,8 +36,7 @@ def extract_with_ffmpeg(
 
     # starting numbering at 1, zero-padded to 6 digits via pattern
     cmd += ["-start_number", "1"]
-    if overwrite:
-        cmd.insert(1, "-y")
+    cmd.insert(1, "-y")
 
     cmd += [pattern]
 
@@ -54,6 +57,10 @@ def extract_with_cv2(
     import cv2  # lazy import
 
     out = Path(out_dir)
+
+    if out.exists() and not overwrite:
+        return
+
     out.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
@@ -94,9 +101,7 @@ def extract_with_cv2(
 
         if save:
             out_path = out / f"{idx:06d}.{ext}"
-
-            if overwrite or not out_path.exists():
-                cv2.imwrite(str(out_path), frame)
+            cv2.imwrite(str(out_path), frame)
             
             idx += 1
 

@@ -1,12 +1,11 @@
 {
   "paths": {
-    "frames_dir": "/Users/dark-creator/solomon/self/key-frame-selection/tmp/data/indoor",
-    "output_dir": "/Users/dark-creator/solomon/self/key-frame-selection/tmp/output/indoor",
-    "key_frames_dir": "/Users/dark-creator/solomon/self/key-frame-selection/tmp/output/indoor-key-frames"
+    "frames_dir": "/workspace/dataspace/sample/ep_2",
+    "output_dir": "/workspace/dataspace/sample/ep_2_output"
   },
 
   "preprocess": {
-    "resize": { "width": 640, "height": 360 },
+    "resize": { "width": 480, "height": 640 },
     "keep_aspect": false,
     "interpolation": "linear"
   },
@@ -14,11 +13,11 @@
   "patching": { "nw": 3, "nh": 3, "centroidal": true },
 
   "shi_tomasi": {
-    "CORNERS_LIMIT_PER_IMAGE": 60,
-    "dedup_radius": 10.0,
-    "qualityLevel": 0.3,
-    "minDistance": 15.0,
-    "max_corners_patch": 10,
+    "corners_limit_per_image": 80,
+    "dedup_radius": 8.0,
+    "qualityLevel": 0.25,
+    "minDistance": 12.0,
+    "max_corners_patch": 12,
     "useHarrisDetector": false,
     "blockSize": 3,
     "gradientSize": 3,
@@ -33,6 +32,27 @@
   },
 
   "selection": {
+    "max_frames": 96,
+    "include_first": false,
+
+    "canny_t1": 50,
+    "canny_t2": 150,
+    "center_frac": 0.50,
+    "min_temporal_gap": 3,
+    "per_bin_pool": 6,
+    "diversity_lambda": 0.2,
+
+    "w_corner": 0.35,
+    "w_center": 0.25,
+    "w_edge":   0.15,
+    "w_entropy":0.10,
+    "w_motion": 0.10,
+    "w_lowret": 0.05,
+
+    "thr_corner_norm": 0.05,
+    "thr_entropy_norm": 0.10,
+    "thr_edge_norm":    0.05,
+
     "retention_tau": 0.5,
     "min_patches_k": 3,
     "copy_keyframes": true
@@ -40,7 +60,6 @@
 
   "visualization": {
     "enabled": true,
-    "dir": "/Users/dark-creator/solomon/self/key-frame-selection/tmp/output/visualization",
     "tracked_color": "#00FF00",
     "new_color": "#0066FF",
     "patch_drop_color": "#FF0000",
