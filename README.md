@@ -5,7 +5,7 @@
 A feature-tracking pipeline for **automatic key frame extraction** from long videos.
 This branch adds a **content-aware, fixed-length selector** on top of the PSFR tracker so you can output **exactly *K* frames** (e.g., $16$) while avoiding black/monotone walls and favoring object-centric views (the robot gripper + manipulated objects).
 
-> On the FindingDory-style data ($480×640$, ~$640$ frames → $16$), this branch improved our metric from **$0.177$ (uniform-$16$)** to **$0.183$**.
+> On the FindingDory-style data ($480×640$, ~ $640$ frames → $16$), this branch improved our metric from **$0.177$ (uniform-16)** to **$0.183$**.
 
 
 ## What’s new in this branch?
