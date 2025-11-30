@@ -12,30 +12,30 @@ from key_frame_selection import select_keyframes_from_frames
 
 
 def main():
-    root = pathlib.Path(__file__).resolve().parent.parent
-    cfg = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    cfg_path = sys.argv[1]
+    cfg = json.loads(pathlib.Path(cfg_path).read_text(encoding="utf-8"))
 
-    # paths
     p = cfg["paths"]
     frames_dir = pathlib.Path(p.get("frames_dir", FRAMES_DIR))
     out_dir = pathlib.Path(p.get("output_dir", OUTPUT_DIR))
-    key_frames_dir = pathlib.Path(p.get("key_frames_dir", KEYFRAMES_DIR))
     preprocess = cfg.get("preprocess", {})
 
-    # keyframe selection on frames
+    visualization = cfg.get("visualization", {})
+    visualization["dir"] = str(out_dir / "visualization")
+
     report = select_keyframes_from_frames(
         frames_dir=frames_dir,
         out_dir=out_dir / "reports",
-        key_frames_dir=key_frames_dir,
+        key_frames_dir=out_dir / "selected_frames",
         patching=cfg["patching"],
         shi=cfg["shi_tomasi"],
         lk=cfg["lucas_kanade"],
         selection=cfg["selection"],
         preprocess=preprocess,
-        visualization=cfg.get("visualization", {})
+        visualization=visualization,
     )
 
-    print(f"Keyframes: {len(report['keyframes'])} saved to {out_dir/'reports'}/keyframes.*")
+    print(f"Keyframes: {len(report['keyframes'])} saved to {out_dir}/reports/keyframes.txt")
 
 
 if __name__ == "__main__":
