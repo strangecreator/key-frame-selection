@@ -36,16 +36,11 @@ Output is a sorted list of **0-based frame indices**.
 **Metrics (oracle protocol).** For each QA instance $q$, a selector outputs a set of indices $S_q$ (budget-limited), and the dataset provides multiple valid evidence sets $G_{q,1}, \dots, G_{q,M_q}$ (each is one acceptable grounding). We report:
 
 - **Intersection (precision-style, penalizes over-selection):**
-  \[
-  \mathrm{Inter}(q) = \min_{m \in \{1,\dots,M_q\}} \frac{|S_q \cap G_{q,m}|}{\max(1, |S_q|)}.
-  \]
+  $$\mathrm{Inter}(q) = \min_{m \in \{1,\dots,M_q\}} \frac{|S_q \cap G_{q,m}|}{\max(1, |S_q|)}.$$
 - **Inclusion (evidence coverage across all valid ground-truth sets):**
-  \[
-  \mathrm{Incl}(q) = \min_{m \in \{1,\dots,M_q\}} \mathbb{I}\big[|S_q \cap G_{q,m}| > 0\big].
-  \]
+  $$\mathrm{Incl}(q) = \min_{m \in \{1,\dots,M_q\}} \mathbb{I}\big[|S_q \cap G_{q,m}| > 0\big].$$
 We average these metrics over all evaluated instances.
 
----
 
 ## Installation:
 
