@@ -16,8 +16,8 @@ The results below are reported using the same evaluation setup.
 
 Given a sequence of frames, the pipeline:
 
-1. Optionally resizes frames deterministically.
-2. Detects Shi–Tomasi corners (patched, response-aware).
+1. Optionally resizes frames.
+2. Detects Shi–Tomasi corners (patched).
 3. Tracks them with pyramidal Lucas–Kanade optical flow.
 4. Computes cheap per-frame cues (corners, center-corners, edge density, grayscale entropy, low-retention count).
 5. Feeds normalized cues + HSV histograms into `select(...)` to output a fixed-budget set of frame indices.
