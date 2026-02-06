@@ -105,6 +105,6 @@ print(indices)
 * `list[int]`: sorted **0-based frame indices** into the input sequence.
 
 
-## Licence
+## Licence:
 
 MIT
