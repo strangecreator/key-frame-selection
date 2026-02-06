@@ -7,7 +7,7 @@ This repository provides a lightweight, CPU-friendly key frame selection library
 - a **video file** (`.mp4`, etc.)
 - a **directory of pre-extracted frames** (e.g. `frame_000001.jpg`, ...)
 
-The core keyframe selector (`select(...)`) was **automatically evolved** via **OpenEvolve**
+The core keyframe selector `select(...)` was **automatically evolved** via **OpenEvolve**
 (https://github.com/algorithmicsuperintelligence/openevolve) using the **inclusion** metric as the optimization target.
 The results below are reported using the same evaluation setup.
 
