@@ -59,7 +59,7 @@ def resize_image(
     H, W = img.shape[:2]
     inter = _INTERP.get(str(interpolation).lower(), cv.INTER_LINEAR)
 
-    if keep_aspect:
+    if keep_aspect and width is not None and height is not None:
         sx = (width / W) if width else math.inf
         sy = (height / H) if height else math.inf
         s = min(sx, sy)
@@ -74,17 +74,42 @@ def resize_image(
     return cv.resize(img, (targetW, targetH), interpolation=inter)
 
 
+# def robust_minmax(arr: np.ndarray, p_lo: float = 5.0, p_hi: float = 95.0) -> np.ndarray:
+#     """
+#     Same behavior as your current code:
+#     - percentile scaling
+#     - if degenerate, widen by 1e-6
+#     """
+#     if arr.size == 0:
+#         return arr
+#     lo = np.percentile(arr, p_lo)
+#     hi = np.percentile(arr, p_hi)
+#     if hi <= lo:
+#         hi = lo + 1e-6
+#     out = (arr - lo) / (hi - lo)
+#     return np.clip(out, 0.0, 1.0)
+
+
 def robust_minmax(arr: np.ndarray, p_lo: float = 5.0, p_hi: float = 95.0) -> np.ndarray:
-    """
-    Same behavior as your current code:
-    - percentile scaling
-    - if degenerate, widen by 1e-6
-    """
+    arr = np.asarray(arr, dtype=np.float64)
+
     if arr.size == 0:
-        return arr
-    lo = np.percentile(arr, p_lo)
-    hi = np.percentile(arr, p_hi)
-    if hi <= lo:
-        hi = lo + 1e-6
-    out = (arr - lo) / (hi - lo)
-    return np.clip(out, 0.0, 1.0)
+        return arr.copy()
+
+    out = np.zeros_like(arr, dtype=np.float64)
+    finite_mask = np.isfinite(arr)
+
+    if not finite_mask.any():
+        return out
+
+    finite_vals = arr[finite_mask]
+    lo = np.percentile(finite_vals, p_lo)
+    hi = np.percentile(finite_vals, p_hi)
+
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        out[finite_mask] = 0.0
+        return out
+
+    scaled = (finite_vals - lo) / (hi - lo)
+    out[finite_mask] = np.clip(scaled, 0.0, 1.0)
+    return out

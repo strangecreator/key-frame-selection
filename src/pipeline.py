@@ -57,7 +57,10 @@ def _preprocess_frame(bgr: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
     )
 
 
-def _gftt_points(gray_u8: np.ndarray, cfg: PipelineConfig, maxCorners: int) -> np.ndarray:
+def _gftt_points(gray_u8: np.ndarray, cfg: PipelineConfig, max_corners: int) -> np.ndarray:
+    if int(max_corners) <= 0:
+        return np.empty((0, 2), dtype=np.float32)
+
     shi = cfg.shi_tomasi
     patch = cfg.patching
     return shi_tomasi_patched_sorted_fast(
@@ -66,7 +69,7 @@ def _gftt_points(gray_u8: np.ndarray, cfg: PipelineConfig, maxCorners: int) -> n
         nh=patch.nh,
         centroidal=patch.centroidal,
         max_corners_patch=int(shi.max_corners_patch),
-        maxCorners=int(maxCorners),
+        maxCorners=int(max_corners),
         dedup_radius=float(shi.dedup_radius),
         qualityLevel=float(shi.qualityLevel),
         minDistance=float(shi.minDistance),
@@ -76,6 +79,222 @@ def _gftt_points(gray_u8: np.ndarray, cfg: PipelineConfig, maxCorners: int) -> n
         k=float(shi.k),
         custom_sort=custom_sorting_by_quality,
     )
+
+
+def _count_center_points(
+    pts: np.ndarray,
+    x: int,
+    y: int,
+    cw: int,
+    ch: int,
+) -> float:
+    if pts.size == 0:
+        return 0.0
+
+    in_center = (
+        (pts[:, 0] >= x) & (pts[:, 0] <= x + cw) &
+        (pts[:, 1] >= y) & (pts[:, 1] <= y + ch)
+    )
+    return float(np.count_nonzero(in_center))
+
+
+def _compute_patch_counts(
+    patches: tp.Sequence[tp.Any],
+    pts: np.ndarray,
+) -> np.ndarray:
+    counts = np.zeros(len(patches), dtype=np.int32)
+    if pts.size == 0:
+        return counts
+
+    for pid, patch in enumerate(patches):
+        idx, _ = filter_patch_points(patch, pts)
+        counts[pid] = int(idx.size)
+    return counts
+
+
+def _compute_patch_counts_with_tracked(
+    patches: tp.Sequence[tp.Any],
+    pts: np.ndarray,
+    tracked_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    counts = np.zeros(len(patches), dtype=np.int32)
+    tracked_counts = np.zeros(len(patches), dtype=np.int32)
+
+    if pts.size == 0:
+        return counts, tracked_counts
+
+    for pid, patch in enumerate(patches):
+        idx, _ = filter_patch_points(patch, pts)
+        counts[pid] = int(idx.size)
+        if idx.size:
+            tracked_counts[pid] = int(tracked_mask[idx].sum())
+
+    return counts, tracked_counts
+
+
+def _count_low_retention_patches(
+    denom_counts: np.ndarray,
+    tracked_counts: np.ndarray,
+    retention_tau: float,
+) -> float:
+    low_ret = 0
+    for pid in range(len(denom_counts)):
+        denom = int(denom_counts[pid])
+        if denom > 0 and (tracked_counts[pid] / float(denom)) < retention_tau:
+            low_ret += 1
+    return float(low_ret)
+
+
+def _iter_video_frames(cap: cv.VideoCapture) -> tp.Iterator[np.ndarray]:
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return
+        yield frame
+
+
+def _iter_frames_from_paths(paths: tp.Sequence[pathlib.Path]) -> tp.Iterator[np.ndarray]:
+    for path in paths[1:]:
+        bgr = cv.imread(str(path), cv.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"Cannot read frame: {path}")
+        yield bgr
+
+
+def _compute_scores_from_bgr_sequence(
+    first_bgr: np.ndarray,
+    rest_frames: tp.Iterable[np.ndarray],
+    total_frames_hint: int,
+    desc: str,
+    cfg: PipelineConfig,
+) -> dict[str, tp.Any]:
+    first_img = _preprocess_frame(first_bgr, cfg)
+    gray0 = to_gray_u8(first_img)
+
+    H, W = gray0.shape[:2]
+    patches = build_patches(W, H, cfg.patching.nw, cfg.patching.nh, cfg.patching.centroidal)
+
+    base_pts = _gftt_points(gray0, cfg, max_corners=cfg.shi_tomasi.corners_limit_per_image)
+    init_counts = _compute_patch_counts(patches, base_pts)
+
+    lk = cfg.lucas_kanade
+    lk_kwargs = dict(
+        winSize=tuple(int(x) for x in lk.winSize),
+        maxLevel=int(lk.maxLevel),
+        criteria=(int(lk.criteria[0]), int(lk.criteria[1]), float(lk.criteria[2])),
+    )
+
+    sel = cfg.selection
+    x, y, cw, ch = _center_rect(W, H, sel.center_frac)
+
+    corner_count = np.zeros(total_frames_hint, dtype=np.float32)
+    center_corner = np.zeros(total_frames_hint, dtype=np.float32)
+    edge_density_arr = np.zeros(total_frames_hint, dtype=np.float32)
+    entropy_arr = np.zeros(total_frames_hint, dtype=np.float32)
+    lowret_count_relative_first_frame = np.zeros(total_frames_hint, dtype=np.float32)
+    lowret_count = np.zeros(total_frames_hint, dtype=np.float32)
+    hsv_hists: list[np.ndarray | None] = [None] * total_frames_hint
+
+    corner_count[0] = float(len(base_pts))
+    center_corner[0] = _count_center_points(base_pts, x, y, cw, ch)
+    edge_density_arr[0] = float(_edge_density(gray0, sel.canny_t1, sel.canny_t2))
+    entropy_arr[0] = float(_gray_entropy(gray0))
+    lowret_count_relative_first_frame[0] = 0.0
+    lowret_count[0] = 0.0
+    hsv_hists[0] = _hsv_hist_cosine(first_img)
+
+    prev_gray = gray0
+    num_frames = 1
+
+    for i, frame in enumerate(
+        tqdm(rest_frames, total=max(0, total_frames_hint - 1), desc=desc, leave=False),
+        start=1,
+    ):
+        curr = _preprocess_frame(frame, cfg)
+        curr_gray = to_gray_u8(curr)
+
+        if base_pts.size == 0:
+            tracked_idx = np.empty((0,), dtype=np.intp)
+            tracked_xy = np.empty((0, 2), dtype=np.float32)
+        else:
+            tracked_idx, tracked_xy = lucas_kanade_track(
+                prev_gray,
+                curr_gray,
+                base_pts,
+                nw=cfg.patching.nw,
+                nh=cfg.patching.nh,
+                centroidal=cfg.patching.centroidal,
+                max_error=float(lk.max_error),
+                **lk_kwargs,
+            )
+            tracked_idx = np.asarray(tracked_idx, dtype=np.intp).reshape(-1)
+            tracked_xy = np.asarray(tracked_xy, dtype=np.float32).reshape(-1, 2)
+
+        tracked_mask = np.zeros(base_pts.shape[0], dtype=np.uint8)
+        if tracked_idx.size:
+            tracked_mask[tracked_idx] = 1
+
+        prev_counts, tracked_counts = _compute_patch_counts_with_tracked(patches, base_pts, tracked_mask)
+
+        lowret_count_relative_first_frame[i] = _count_low_retention_patches(
+            init_counts,
+            tracked_counts,
+            float(sel.retention_tau),
+        )
+        lowret_count[i] = _count_low_retention_patches(
+            prev_counts,
+            tracked_counts,
+            float(sel.retention_tau),
+        )
+
+        refill = max(0, int(cfg.shi_tomasi.corners_limit_per_image) - int(tracked_xy.shape[0]))
+        if refill <= 0:
+            new_pts = np.empty((0, 2), dtype=np.float32)
+        else:
+            new_pts = _gftt_points(curr_gray, cfg, max_corners=refill)
+
+        new_pts = remove_duplicate_points_from_second_array(
+            tracked_xy,
+            new_pts,
+            radius=float(cfg.shi_tomasi.dedup_radius),
+        )
+        base_pts = np.vstack([tracked_xy, new_pts]) if new_pts.size else tracked_xy
+
+        corner_count[i] = float(len(base_pts))
+        center_corner[i] = _count_center_points(base_pts, x, y, cw, ch)
+        edge_density_arr[i] = float(_edge_density(curr_gray, sel.canny_t1, sel.canny_t2))
+        entropy_arr[i] = float(_gray_entropy(curr_gray))
+        hsv_hists[i] = _hsv_hist_cosine(curr)
+
+        prev_gray = curr_gray
+        num_frames = i + 1
+
+    corner_count = corner_count[:num_frames]
+    center_corner = center_corner[:num_frames]
+    edge_density_arr = edge_density_arr[:num_frames]
+    entropy_arr = entropy_arr[:num_frames]
+    lowret_count_relative_first_frame = lowret_count_relative_first_frame[:num_frames]
+    lowret_count = lowret_count[:num_frames]
+
+    corner_n = robust_minmax(corner_count.astype(np.float32))
+    center_n = robust_minmax(center_corner.astype(np.float32))
+    edge_n = robust_minmax(edge_density_arr.astype(np.float32))
+    entr_n = robust_minmax(entropy_arr.astype(np.float32))
+    lowret_first_n = robust_minmax(lowret_count_relative_first_frame.astype(np.float32))
+    lowret_n = robust_minmax(lowret_count.astype(np.float32))
+
+    scores = np.stack(
+        [corner_n, center_n, edge_n, entr_n, lowret_first_n, lowret_n],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+    hsv_arr = np.array(hsv_hists[:num_frames], dtype=np.float32)
+
+    return {
+        "scores": scores,
+        "hsv_hists": hsv_arr,
+        "num_frames": int(num_frames),
+    }
 
 
 def compute_scores_from_video(
@@ -89,148 +308,25 @@ def compute_scores_from_video(
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video: {video_path}")
 
-    T = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
-    if T <= 0:
+    try:
+        T = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+        if T <= 0:
+            raise ValueError(f"No frames in video: {video_path}")
+
+        cap.set(cv.CAP_PROP_POS_FRAMES, 0)
+        ret, first_frame = cap.read()
+        if not ret or first_frame is None:
+            raise ValueError(f"Failed to read first frame: {video_path}")
+
+        return _compute_scores_from_bgr_sequence(
+            first_bgr=first_frame,
+            rest_frames=_iter_video_frames(cap),
+            total_frames_hint=T,
+            desc=f"scoring {video_path.name}",
+            cfg=cfg,
+        )
+    finally:
         cap.release()
-        raise ValueError(f"No frames in video: {video_path}")
-
-    cap.set(cv.CAP_PROP_POS_FRAMES, 0)
-    ret, first_frame = cap.read()
-    if not ret or first_frame is None:
-        cap.release()
-        raise ValueError(f"Failed to read first frame: {video_path}")
-
-    first_img = _preprocess_frame(first_frame, cfg)
-    grey0 = to_gray_u8(first_img)
-
-    H, W = grey0.shape[:2]
-    patches = build_patches(W, H, cfg.patching.nw, cfg.patching.nh, cfg.patching.centroidal)
-
-    base_pts = _gftt_points(grey0, cfg, maxCorners=cfg.shi_tomasi.corners_limit_per_image)
-
-    init_counts = np.zeros(len(patches), dtype=np.int32)
-    for pid, p in enumerate(patches):
-        idx, _ = filter_patch_points(p, base_pts)
-        init_counts[pid] = int(idx.size)
-
-    lk = cfg.lucas_kanade
-    lk_kwargs = dict(
-        winSize=tuple(int(x) for x in lk.winSize),
-        maxLevel=int(lk.maxLevel),
-        criteria=(int(lk.criteria[0]), int(lk.criteria[1]), float(lk.criteria[2])),
-    )
-
-    sel = cfg.selection
-
-    corner_count = np.zeros(T, dtype=np.float32)
-    center_corner = np.zeros(T, dtype=np.float32)
-    edge_density_arr = np.zeros(T, dtype=np.float32)
-    entropy_arr = np.zeros(T, dtype=np.float32)
-    lowret_count = np.zeros(T, dtype=np.float32)
-    hsv_hists: list[np.ndarray] = [None] * T  # type: ignore
-
-    corner_count[0] = float(len(base_pts))
-    x, y, cw, ch = _center_rect(W, H, sel.center_frac)
-    if len(base_pts):
-        in_center = (
-            (base_pts[:, 0] >= x) & (base_pts[:, 0] <= x + cw) &
-            (base_pts[:, 1] >= y) & (base_pts[:, 1] <= y + ch)
-        )
-        center_corner[0] = float(np.count_nonzero(in_center))
-    edge_density_arr[0] = float(_edge_density(grey0, sel.canny_t1, sel.canny_t2))
-    entropy_arr[0] = float(_gray_entropy(grey0))
-    lowret_count[0] = 0.0
-    hsv_hists[0] = _hsv_hist_cosine(first_img)
-
-    prevg = grey0
-
-    for i in tqdm(range(1, T), desc=f"scoring {video_path.name}", leave=False):
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            # stop early if decoding ended
-            corner_count = corner_count[:i]
-            center_corner = center_corner[:i]
-            edge_density_arr = edge_density_arr[:i]
-            entropy_arr = entropy_arr[:i]
-            lowret_count = lowret_count[:i]
-            hsv_hists = hsv_hists[:i]
-            T = i
-            break
-
-        curr = _preprocess_frame(frame, cfg)
-        currg = to_gray_u8(curr)
-
-        tracked_idx, tracked_xy = lucas_kanade_track(
-            prevg,
-            currg,
-            base_pts,
-            nw=cfg.patching.nw,
-            nh=cfg.patching.nh,
-            centroidal=cfg.patching.centroidal,
-            max_error=float(lk.max_error),
-            **lk_kwargs,
-        )
-
-        prevg = currg
-
-        tracked_mask = np.zeros(base_pts.shape[0], dtype=np.uint8)
-        tracked_mask[tracked_idx] = 1
-
-        per_patch_tracked = np.zeros(len(patches), dtype=np.int32)
-        for pid, p in enumerate(patches):
-            idx, _ = filter_patch_points(p, base_pts)
-            if idx.size:
-                per_patch_tracked[pid] = int(tracked_mask[idx].sum())
-
-        low_ret = 0
-        for pid in range(len(patches)):
-            denom = int(init_counts[pid])
-            if denom > 0 and (per_patch_tracked[pid] / float(denom)) < float(sel.retention_tau):
-                low_ret += 1
-        lowret_count[i] = float(low_ret)
-
-        refill = max(0, int(cfg.shi_tomasi.corners_limit_per_image) - int(tracked_xy.shape[0]))
-        if refill <= 0:
-            new_pts = np.empty((0, 2), np.float32)
-        else:
-            new_pts = _gftt_points(currg, cfg, maxCorners=refill)
-
-        new_pts = remove_duplicate_points_from_second_array(
-            tracked_xy,
-            new_pts,
-            radius=float(cfg.shi_tomasi.dedup_radius),
-        )
-        base_pts = np.vstack([tracked_xy, new_pts]) if new_pts.size else tracked_xy
-
-        corner_count[i] = float(len(base_pts))
-        x, y, cw, ch = _center_rect(W, H, sel.center_frac)
-        if len(base_pts):
-            in_center = (
-                (base_pts[:, 0] >= x) & (base_pts[:, 0] <= x + cw) &
-                (base_pts[:, 1] >= y) & (base_pts[:, 1] <= y + ch)
-            )
-            center_corner[i] = float(np.count_nonzero(in_center))
-        edge_density_arr[i] = float(_edge_density(currg, sel.canny_t1, sel.canny_t2))
-        entropy_arr[i] = float(_gray_entropy(currg))
-        hsv_hists[i] = _hsv_hist_cosine(curr)
-
-    cap.release()
-
-    # normalize (robust minmax)
-    corner_n = robust_minmax(corner_count.astype(np.float32))
-    center_n = robust_minmax(center_corner.astype(np.float32))
-    edge_n = robust_minmax(edge_density_arr.astype(np.float32))
-    entr_n = robust_minmax(entropy_arr.astype(np.float32))
-    lowret_n = robust_minmax(lowret_count.astype(np.float32))
-
-    scores_5 = np.stack([corner_n, center_n, edge_n, entr_n, lowret_n], axis=1).astype(np.float32, copy=False)
-    hsv_arr = np.array(hsv_hists, dtype=np.float32)
-
-    return {
-        "scores": scores_5,
-        "hsv_hists": hsv_arr,
-        "num_frames": int(T),
-    }
 
 
 def compute_scores_from_frames_dir(
@@ -247,126 +343,19 @@ def compute_scores_from_frames_dir(
     if not paths:
         raise FileNotFoundError(f"No frames found in {frames_dir} (pattern={glob_pattern})")
 
-    first_img = _preprocess_frame(cv.imread(str(paths[0]), cv.IMREAD_COLOR), cfg)
-    if first_img is None:
+    first_bgr = cv.imread(str(paths[0]), cv.IMREAD_COLOR)
+    if first_bgr is None:
         raise FileNotFoundError(f"Cannot read frame: {paths[0]}")
-    grey0 = to_gray_u8(first_img)
 
-    H, W = grey0.shape[:2]
-    patches = build_patches(W, H, cfg.patching.nw, cfg.patching.nh, cfg.patching.centroidal)
-    base_pts = _gftt_points(grey0, cfg, maxCorners=cfg.shi_tomasi.corners_limit_per_image)
-
-    init_counts = np.zeros(len(patches), dtype=np.int32)
-    for pid, p in enumerate(patches):
-        idx, _ = filter_patch_points(p, base_pts)
-        init_counts[pid] = int(idx.size)
-
-    lk = cfg.lucas_kanade
-    lk_kwargs = dict(
-        winSize=tuple(int(x) for x in lk.winSize),
-        maxLevel=int(lk.maxLevel),
-        criteria=(int(lk.criteria[0]), int(lk.criteria[1]), float(lk.criteria[2])),
+    payload = _compute_scores_from_bgr_sequence(
+        first_bgr=first_bgr,
+        rest_frames=_iter_frames_from_paths(paths),
+        total_frames_hint=len(paths),
+        desc=f"scoring frames in {frames_dir.name}",
+        cfg=cfg,
     )
-    sel = cfg.selection
-
-    T = len(paths)
-    corner_count = np.zeros(T, dtype=np.float32)
-    center_corner = np.zeros(T, dtype=np.float32)
-    edge_density_arr = np.zeros(T, dtype=np.float32)
-    entropy_arr = np.zeros(T, dtype=np.float32)
-    lowret_count = np.zeros(T, dtype=np.float32)
-    hsv_hists: list[np.ndarray] = [None] * T  # type: ignore
-
-    corner_count[0] = float(len(base_pts))
-    x, y, cw, ch = _center_rect(W, H, sel.center_frac)
-    if len(base_pts):
-        in_center = (
-            (base_pts[:, 0] >= x) & (base_pts[:, 0] <= x + cw) &
-            (base_pts[:, 1] >= y) & (base_pts[:, 1] <= y + ch)
-        )
-        center_corner[0] = float(np.count_nonzero(in_center))
-    edge_density_arr[0] = float(_edge_density(grey0, sel.canny_t1, sel.canny_t2))
-    entropy_arr[0] = float(_gray_entropy(grey0))
-    lowret_count[0] = 0.0
-    hsv_hists[0] = _hsv_hist_cosine(first_img)
-
-    prevg = grey0
-
-    for i in tqdm(range(1, T), desc=f"scoring frames in {frames_dir.name}", leave=False):
-        bgr = cv.imread(str(paths[i]), cv.IMREAD_COLOR)
-        if bgr is None:
-            raise FileNotFoundError(f"Cannot read frame: {paths[i]}")
-        curr = _preprocess_frame(bgr, cfg)
-        currg = to_gray_u8(curr)
-
-        tracked_idx, tracked_xy = lucas_kanade_track(
-            prevg,
-            currg,
-            base_pts,
-            nw=cfg.patching.nw,
-            nh=cfg.patching.nh,
-            centroidal=cfg.patching.centroidal,
-            max_error=float(lk.max_error),
-            **lk_kwargs,
-        )
-        prevg = currg
-
-        tracked_mask = np.zeros(base_pts.shape[0], dtype=np.uint8)
-        tracked_mask[tracked_idx] = 1
-
-        per_patch_tracked = np.zeros(len(patches), dtype=np.int32)
-        for pid, p in enumerate(patches):
-            idx, _ = filter_patch_points(p, base_pts)
-            if idx.size:
-                per_patch_tracked[pid] = int(tracked_mask[idx].sum())
-
-        low_ret = 0
-        for pid in range(len(patches)):
-            denom = int(init_counts[pid])
-            if denom > 0 and (per_patch_tracked[pid] / float(denom)) < float(sel.retention_tau):
-                low_ret += 1
-        lowret_count[i] = float(low_ret)
-
-        refill = max(0, int(cfg.shi_tomasi.corners_limit_per_image) - int(tracked_xy.shape[0]))
-        if refill <= 0:
-            new_pts = np.empty((0, 2), np.float32)
-        else:
-            new_pts = _gftt_points(currg, cfg, maxCorners=refill)
-
-        new_pts = remove_duplicate_points_from_second_array(
-            tracked_xy,
-            new_pts,
-            radius=float(cfg.shi_tomasi.dedup_radius),
-        )
-        base_pts = np.vstack([tracked_xy, new_pts]) if new_pts.size else tracked_xy
-
-        corner_count[i] = float(len(base_pts))
-        x, y, cw, ch = _center_rect(W, H, sel.center_frac)
-        if len(base_pts):
-            in_center = (
-                (base_pts[:, 0] >= x) & (base_pts[:, 0] <= x + cw) &
-                (base_pts[:, 1] >= y) & (base_pts[:, 1] <= y + ch)
-            )
-            center_corner[i] = float(np.count_nonzero(in_center))
-        edge_density_arr[i] = float(_edge_density(currg, sel.canny_t1, sel.canny_t2))
-        entropy_arr[i] = float(_gray_entropy(currg))
-        hsv_hists[i] = _hsv_hist_cosine(curr)
-
-    corner_n = robust_minmax(corner_count.astype(np.float32))
-    center_n = robust_minmax(center_corner.astype(np.float32))
-    edge_n = robust_minmax(edge_density_arr.astype(np.float32))
-    entr_n = robust_minmax(entropy_arr.astype(np.float32))
-    lowret_n = robust_minmax(lowret_count.astype(np.float32))
-
-    scores_5 = np.stack([corner_n, center_n, edge_n, entr_n, lowret_n], axis=1).astype(np.float32, copy=False)
-    hsv_arr = np.array(hsv_hists, dtype=np.float32)
-
-    return {
-        "scores": scores_5,
-        "hsv_hists": hsv_arr,
-        "num_frames": int(T),
-        "frame_paths": [str(p) for p in paths],
-    }
+    payload["frame_paths"] = [str(p) for p in paths]
+    return payload
 
 
 def select_from_video(
@@ -424,7 +413,6 @@ def dump_scores_json(path: str | pathlib.Path, payload: dict[str, tp.Any]) -> No
     p = pathlib.Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    # numpy -> lists
     out: dict[str, tp.Any] = dict(payload)
     if "scores" in out and isinstance(out["scores"], np.ndarray):
         out["scores"] = out["scores"].tolist()

@@ -7,8 +7,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ResizeConfig:
     # preprocess.resize
-    width: int | None = 480
-    height: int | None = 640
+    width: int | None = None
+    height: int | None = None
 
     # preprocess.keep_aspect / preprocess.interpolation
     keep_aspect: bool = False
@@ -51,7 +51,7 @@ class LucasKanadeConfig:
 @dataclass(frozen=True)
 class SelectionConfig:
     # selection.max_frames
-    max_frames: int = 96
+    max_frames: int = 16
 
     # used by scoring
     canny_t1: int = 50
